@@ -1,7 +1,7 @@
 json5 implemented by golang
 ================
 
-[![Build Status](https://travis-ci.org/yosuke-furukawa/json5.svg?branch=master)](https://travis-ci.org/yosuke-furukawa/json5)
+Forked version of [yosuke-furukawa/json5](https://github.com/yosuke-furukawa/json5), uses `json5` tag instead of default `json` tag.
 
 [JSON5](https://github.com/aseemk/json5) is Yet another JSON.
 
@@ -21,7 +21,7 @@ $ json5 -c path/to/test.json5 -o path/to/test.json # output path/to/test.json
 
 # go get
 ```
-$ go get github.com/yosuke-furukawa/json5
+$ go get github.com/kokizzu/json5b
 ```
 
 # example
@@ -32,7 +32,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/yosuke-furukawa/json5/encoding/json5"
+	"github.com/kokizzu/json5b/encoding/json5"
 	"os"
 )
 

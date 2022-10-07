@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package json5
+package json5b
 
 import (
 	"bytes"
@@ -13,30 +13,30 @@ import (
 )
 
 type Optionals struct {
-	Sr string `json:"sr"`
-	So string `json:"so,omitempty"`
-	Sw string `json:"-"`
+	Sr string `json5:"sr"`
+	So string `json5:"so,omitempty"`
+	Sw string `json5:"-"`
 
-	Ir int `json:"omitempty"` // actually named omitempty, not an option
-	Io int `json:"io,omitempty"`
+	Ir int `json5:"omitempty"` // actually named omitempty, not an option
+	Io int `json5:"io,omitempty"`
 
-	Slr []string `json:"slr,random"`
-	Slo []string `json:"slo,omitempty"`
+	Slr []string `json5:"slr,random"`
+	Slo []string `json5:"slo,omitempty"`
 
-	Mr map[string]interface{} `json:"mr"`
-	Mo map[string]interface{} `json:",omitempty"`
+	Mr map[string]interface{} `json5:"mr"`
+	Mo map[string]interface{} `json5:",omitempty"`
 
-	Fr float64 `json:"fr"`
-	Fo float64 `json:"fo,omitempty"`
+	Fr float64 `json5:"fr"`
+	Fo float64 `json5:"fo,omitempty"`
 
-	Br bool `json:"br"`
-	Bo bool `json:"bo,omitempty"`
+	Br bool `json5:"br"`
+	Bo bool `json5:"bo,omitempty"`
 
-	Ur uint `json:"ur"`
-	Uo uint `json:"uo,omitempty"`
+	Ur uint `json5:"ur"`
+	Uo uint `json5:"uo,omitempty"`
 
-	Str struct{} `json:"str"`
-	Sto struct{} `json:"sto,omitempty"`
+	Str struct{} `json5:"str"`
+	Sto struct{} `json5:"sto,omitempty"`
 }
 
 var optionalsExpected = `{
@@ -67,9 +67,9 @@ func TestOmitEmpty(t *testing.T) {
 }
 
 type StringTag struct {
-	BoolStr bool   `json:",string"`
-	IntStr  int64  `json:",string"`
-	StrStr  string `json:",string"`
+	BoolStr bool   `json5:",string"`
+	IntStr  int64  `json5:",string"`
+	StrStr  string `json5:",string"`
 }
 
 var stringTagExpected = `{
@@ -320,7 +320,7 @@ func TestEmbeddedBug(t *testing.T) {
 }
 
 type BugD struct { // Same as BugA after tagging.
-	XXX string `json:"S"`
+	XXX string `json5:"S"`
 }
 
 // BugD's tagged S field should dominate BugA's.

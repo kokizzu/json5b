@@ -8,7 +8,7 @@
 // We benchmark converting between the JSON form
 // and in-memory data structures.
 
-package json5
+package json5b
 
 import (
 	"bytes"
@@ -19,18 +19,18 @@ import (
 )
 
 type codeResponse struct {
-	Tree     *codeNode `json:"tree"`
-	Username string    `json:"username"`
+	Tree     *codeNode `json5:"tree"`
+	Username string    `json5:"username"`
 }
 
 type codeNode struct {
-	Name     string      `json:"name"`
-	Kids     []*codeNode `json:"kids"`
-	CLWeight float64     `json:"cl_weight"`
-	Touches  int         `json:"touches"`
-	MinT     int64       `json:"min_t"`
-	MaxT     int64       `json:"max_t"`
-	MeanT    int64       `json:"mean_t"`
+	Name     string      `json5:"name"`
+	Kids     []*codeNode `json5:"kids"`
+	CLWeight float64     `json5:"cl_weight"`
+	Touches  int         `json5:"touches"`
+	MinT     int64       `json5:"min_t"`
+	MaxT     int64       `json5:"max_t"`
+	MeanT    int64       `json5:"mean_t"`
 }
 
 var codeJSON []byte

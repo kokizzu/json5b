@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package json5
+package json5b
 
 import (
 	"bytes"
@@ -19,11 +19,11 @@ import (
 type T struct {
 	X string
 	Y int
-	Z int `json:"-"`
+	Z int `json5:"-"`
 }
 
 type U struct {
-	Alphabet string `json:"alpha"`
+	Alphabet string `json5:"alpha"`
 }
 
 type V struct {
@@ -113,8 +113,8 @@ type Top struct {
 	Level0 int
 	Embed0
 	*Embed0a
-	*Embed0b `json:"e,omitempty"` // treated as named
-	Embed0c  `json:"-"`           // ignored
+	*Embed0b `json5:"e,omitempty"` // treated as named
+	Embed0c  `json5:"-"`           // ignored
 	Loop
 	Embed0p // has Point with X, Y, used
 	Embed0q // has Point with Z, used
@@ -125,15 +125,15 @@ type Embed0 struct {
 	Level1b int // used because Embed0a's Level1b is renamed
 	Level1c int // used because Embed0a's Level1c is ignored
 	Level1d int // annihilated by Embed0a's Level1d
-	Level1e int `json:"x"` // annihilated by Embed0a.Level1e
+	Level1e int `json5:"x"` // annihilated by Embed0a.Level1e
 }
 
 type Embed0a struct {
-	Level1a int `json:"Level1a,omitempty"`
-	Level1b int `json:"LEVEL1B,omitempty"`
-	Level1c int `json:"-"`
+	Level1a int `json5:"Level1a,omitempty"`
+	Level1b int `json5:"LEVEL1B,omitempty"`
+	Level1c int `json5:"-"`
 	Level1d int // annihilated by Embed0's Level1d
-	Level1f int `json:"x"` // annihilated by Embed0's Level1e
+	Level1f int `json5:"x"` // annihilated by Embed0's Level1e
 }
 
 type Embed0b Embed0
@@ -149,8 +149,8 @@ type Embed0q struct {
 }
 
 type Loop struct {
-	Loop1 int `json:",omitempty"`
-	Loop2 int `json:",omitempty"`
+	Loop1 int `json5:",omitempty"`
+	Loop2 int `json5:",omitempty"`
 	*Loop
 }
 
@@ -207,8 +207,8 @@ type unmarshalTest struct {
 
 type Ambig struct {
 	// Given "hello", the first match should win.
-	First  int `json:"HELLO"`
-	Second int `json:"Hello"`
+	First  int `json5:"HELLO"`
+	Second int `json5:"Hello"`
 }
 
 type XYZ struct {
@@ -668,7 +668,7 @@ func TestEscape(t *testing.T) {
 
 // WrongString is a struct that's misusing the ,string modifier.
 type WrongString struct {
-	Message string `json:"result,string"`
+	Message string `json5:"result,string"`
 }
 
 type wrongStringTest struct {
@@ -718,10 +718,10 @@ type All struct {
 	Float32 float32
 	Float64 float64
 
-	Foo  string `json:"bar"`
-	Foo2 string `json:"bar2,dummyopt"`
+	Foo  string `json5:"bar"`
+	Foo2 string `json5:"bar2,dummyopt"`
 
-	IntStr int64 `json:",string"`
+	IntStr int64 `json5:",string"`
 
 	PBool    *bool
 	PInt     *int
@@ -1046,8 +1046,8 @@ func TestRefUnmarshal(t *testing.T) {
 // Issue 3450
 func TestEmptyString(t *testing.T) {
 	type T2 struct {
-		Number1 int `json:",string"`
-		Number2 int `json:",string"`
+		Number1 int `json5:",string"`
+		Number2 int `json5:",string"`
 	}
 	data := `{"Number1":"1", "Number2":""}`
 	dec := NewDecoder(strings.NewReader(data))
@@ -1065,8 +1065,8 @@ func TestEmptyString(t *testing.T) {
 // Issue 7046
 func TestNullString(t *testing.T) {
 	type T struct {
-		A int `json:",string"`
-		B int `json:",string"`
+		A int `json5:",string"`
+		B int `json5:",string"`
 	}
 	data := []byte(`{"A": "1", "B": null}`)
 	var s T
@@ -1240,8 +1240,8 @@ func TestUnmarshalSyntax(t *testing.T) {
 // Issue 4660
 type unexportedFields struct {
 	Name string
-	m    map[string]interface{} `json:"-"`
-	m2   map[string]interface{} `json:"abcd"`
+	m    map[string]interface{} `json5:"-"`
+	m2   map[string]interface{} `json5:"abcd"`
 }
 
 func TestUnmarshalUnexported(t *testing.T) {
@@ -1362,7 +1362,7 @@ type objectDecoder struct {
 
 func (o *objectDecoder) UnmarshalJSON(data []byte) error {
 	var v struct {
-		A int `json:"a"`
+		A int `json5:"a"`
 	}
 
 	err := json.Unmarshal(data, &v)

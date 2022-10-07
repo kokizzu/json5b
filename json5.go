@@ -7,7 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 
-	"github.com/yosuke-furukawa/json5/encoding/json5"
+	"github.com/kokizzu/json5b/encoding/json5b"
 )
 
 func main() {
@@ -15,7 +15,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: json5 \n")
+	fmt.Fprintf(os.Stderr, "usage: json5b \n")
 	fmt.Fprintf(os.Stderr, "Compiles JSON5 file into sibling JSON.\n")
 	flag.PrintDefaults()
 	os.Exit(2)
@@ -23,7 +23,7 @@ func usage() {
 
 func procArgs() {
 	flag.Usage = usage
-	json5Path := flag.String("c", "", "path/to/file.json5, or blank for stdin")
+	json5Path := flag.String("c", "", "path/to/file.json5b, or blank for stdin")
 	outputPath := flag.String("o", "", "path/to/file.json, or blank for stdout")
 	flag.Parse()
 	var file *os.File
@@ -39,7 +39,7 @@ func procArgs() {
 	}
 
 	var data interface{}
-	dec := json5.NewDecoder(file)
+	dec := json5b.NewDecoder(file)
 	err = dec.Decode(&data)
 	if err != nil {
 		fmt.Println(err)
