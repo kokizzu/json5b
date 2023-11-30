@@ -8,7 +8,7 @@ Forked version of [yosuke-furukawa/json5](https://github.com/yosuke-furukawa/jso
 # INSTALL
 
 ```
-$ brew tap yosuke-furukawa/json5
+$ brew tap yosuke-furukawa/json5 # original one
 $ brew install json5
 ```
 
@@ -32,13 +32,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/kokizzu/json5b/encoding/json5"
+	"github.com/kokizzu/json5b/encoding/json5b"
 	"os"
 )
 
 func main() {
 	var data interface{}
-	dec := json5.NewDecoder(os.Stdin)
+	dec := json5b.NewDecoder(os.Stdin)
 	err := dec.Decode(&data)
 	if err != nil {
 		fmt.Println(err)
