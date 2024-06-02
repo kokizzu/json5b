@@ -73,10 +73,42 @@ $ json5 -c example.json5
 #}
 ```
 
-# TODO
-- block comment
-- multiline string
-- hexadecimal notation
+## Example using fiber
 
+```go
+package main
 
+import (
+	"github.com/gofiber/fiber/v2"
+	"github.com/kokizzu/json5b/encoding/json5b"
+)
 
+func main() {
+	app := fiber.New(fiber.Config{
+		Immutable: true, // if you are using
+		JSONDecoder: json5b.Unmarshal,
+	})
+
+	app.Post("/json5", func(c *fiber.Ctx) error {
+		var data struct {
+			Name string //`json5:"name"` // will still work even when no tag
+			Age  int    `json5:"age"`
+		}
+		err := c.BodyParser(&data)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+	 	}
+		return c.JSON(data)
+	})
+
+	app.Listen(":3000")
+}
+```
+then run
+
+```shell
+curl -X POST -H 'content-type: encoding/json' -d "{name:'John',age:25}" http://localhost:3000/json5
+{"Name":"John","Age":25}%                                
+```
