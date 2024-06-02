@@ -27,7 +27,7 @@ const (
 //   - S maps to s and to U+017F 'ſ' Latin small letter long s
 //   - k maps to K and to U+212A 'K' Kelvin sign
 //
-// See http://play.golang.org/p/tTxjOc0OGo
+// See https://play.golang.org/p/tTxjOc0OGo
 //
 // The returned function is specialized for matching against s and
 // should only be given s. It's not curried for performance reasons.

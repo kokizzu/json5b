@@ -2,9 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Represents JSON data structure using native Go types: booleans, floats,
-// strings, arrays, and maps.
-
+// Package json5b implements decoding of JSON5 values.
 package json5b
 
 import (
@@ -13,14 +11,32 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
 	"strconv"
-	"strings"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
+
+// UnmarshalErrHandler while decode error, will inject this handler, catch error.
+// if you want to ignore this error, you can return nil
+type UnmarshalErrHandler func(err error) error
+
+var (
+	usedUnmarshalErrHandlerHook atomic.Bool
+	unmarshalErrHandlerHook     UnmarshalErrHandler = func(err error) error { return err }
+)
+
+// UseUnmarshalErrHandler register a yourself error handler, only once
+func UseUnmarshalErrHandler(handler UnmarshalErrHandler) {
+	if usedUnmarshalErrHandlerHook.Swap(true) {
+		return
+	}
+	unmarshalErrHandlerHook = handler
+}
 
 // Unmarshal parses the JSON-encoded data and stores the result
 // in the value pointed to by v.
@@ -30,14 +46,15 @@ import (
 // with the following additional rules:
 //
 // To unmarshal JSON into a pointer, Unmarshal first handles the case of
-// the JSON being the JSON literal null.  In that case, Unmarshal sets
-// the pointer to nil.  Otherwise, Unmarshal unmarshals the JSON into
-// the value pointed at by the pointer.  If the pointer is nil, Unmarshal
+// the JSON being the JSON literal null. In that case, Unmarshal sets
+// the pointer to nil. Otherwise, Unmarshal unmarshals the JSON into
+// the value pointed at by the pointer. If the pointer is nil, Unmarshal
 // allocates a new value for it to point to.
 //
 // To unmarshal JSON into a struct, Unmarshal matches incoming object
 // keys to the keys used by Marshal (either the struct field name or its tag),
 // preferring an exact match but also accepting a case-insensitive match.
+// Unmarshal will only set exported fields of the struct.
 //
 // To unmarshal JSON into an interface value,
 // Unmarshal stores one of these in the interface value:
@@ -49,9 +66,27 @@ import (
 //	map[string]interface{}, for JSON objects
 //	nil for JSON null
 //
+// To unmarshal a JSON array into a slice, Unmarshal resets the slice length
+// to zero and then appends each element to the slice.
+// As a special case, to unmarshal an empty JSON array into a slice,
+// Unmarshal replaces the slice with a new empty slice.
+//
+// To unmarshal a JSON array into a Go array, Unmarshal decodes
+// JSON array elements into corresponding Go array elements.
+// If the Go array is smaller than the JSON array,
+// the additional JSON array elements are discarded.
+// If the JSON array is smaller than the Go array,
+// the additional Go array elements are set to zero values.
+//
+// To unmarshal a JSON object into a map, Unmarshal first establishes a map to
+// use, If the map is nil, Unmarshal allocates a new map. Otherwise Unmarshal
+// reuses the existing map, keeping existing entries. Unmarshal then stores key-
+// value pairs from the JSON object into the map.  The map's key type must
+// either be a string or implement encoding.TextUnmarshaler.
+//
 // If a JSON value is not appropriate for a given target type,
 // or if a JSON number overflows the target type, Unmarshal
-// skips that field and completes the unmarshalling as best it can.
+// skips that field and completes the unmarshaling as best it can.
 // If no more serious errors are encountered, Unmarshal returns
 // an UnmarshalTypeError describing the earliest such error.
 //
@@ -78,7 +113,7 @@ func Unmarshal(data []byte, v interface{}) error {
 	return d.unmarshal(v)
 }
 
-// Unmarshaler is the interface implemented by objects
+// Unmarshaler is the interface implemented by types
 // that can unmarshal a JSON description of themselves.
 // The input can be assumed to be a valid encoding of
 // a JSON value. UnmarshalJSON must copy the JSON data
@@ -90,8 +125,9 @@ type Unmarshaler interface {
 // An UnmarshalTypeError describes a JSON value that was
 // not appropriate for a value of a specific Go type.
 type UnmarshalTypeError struct {
-	Value string       // description of JSON value - "bool", "array", "number -5"
-	Type  reflect.Type // type of Go value it could not be assigned to
+	Value  string       // description of JSON value - "bool", "array", "number -5"
+	Type   reflect.Type // type of Go value it could not be assigned to
+	Offset int64        // error occurred after reading Offset bytes
 }
 
 func (e *UnmarshalTypeError) Error() string {
@@ -158,23 +194,122 @@ func (n Number) String() string { return string(n) }
 
 // Float64 returns the number as a float64.
 func (n Number) Float64() (float64, error) {
+	if h, ok := hexString(string(n)); ok {
+		n, err := strconv.ParseInt(h, 16, 64)
+		if err != nil {
+			return 0, err
+		}
+		f := float64(n)
+		if h[0] == '-' && n == 0 {
+			f = -f
+		}
+		return f, nil
+	}
 	return strconv.ParseFloat(string(n), 64)
 }
 
 // Int64 returns the number as an int64.
 func (n Number) Int64() (int64, error) {
+	if h, ok := hexString(string(n)); ok {
+		return strconv.ParseInt(h, 16, 64)
+	}
 	return strconv.ParseInt(string(n), 10, 64)
+}
+
+// isValidNumber reports whether s is a valid JSON number literal.
+func isValidNumber(s string) bool {
+	// This function implements the JSON numbers grammar.
+	// See https://tools.ietf.org/html/rfc7159#section-6
+	// and http://json.org/number.gif
+
+	if s == "" {
+		return false
+	}
+
+	if s == "NaN" {
+		return true
+	}
+
+	// Optional -/+
+	if s[0] == '-' || s[0] == '+' {
+		s = s[1:]
+		if s == "" {
+			return false
+		}
+	}
+
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		s = s[2:]
+		for len(s) > 0 {
+			if (s[0] >= '0' && s[0] <= '9') || (s[0] >= 'a' && s[0] <= 'f') || (s[0] >= 'A' && s[0] <= 'F') {
+				s = s[1:]
+				continue
+			}
+			return false
+		}
+		return true
+	}
+
+	// Digits
+	switch {
+	default:
+		return false
+
+	case s == "Infinity":
+		return true
+
+	case s[0] == '0':
+		s = s[1:]
+
+	case s[0] == '.':
+		if len(s) == 1 {
+			return false
+		}
+
+	case '1' <= s[0] && s[0] <= '9':
+		s = s[1:]
+		for len(s) > 0 && '0' <= s[0] && s[0] <= '9' {
+			s = s[1:]
+		}
+	}
+
+	// decimal followed by 0 or more digits
+	if len(s) > 0 && s[0] == '.' {
+		s = s[1:]
+		for len(s) > 0 && '0' <= s[0] && s[0] <= '9' {
+			s = s[1:]
+		}
+	}
+
+	// e or E followed by an optional - or + and
+	// 1 or more digits.
+	if len(s) >= 2 && (s[0] == 'e' || s[0] == 'E') {
+		s = s[1:]
+		if s[0] == '+' || s[0] == '-' {
+			s = s[1:]
+			if s == "" {
+				return false
+			}
+		}
+		for len(s) > 0 && '0' <= s[0] && s[0] <= '9' {
+			s = s[1:]
+		}
+	}
+
+	// Make sure we are at the end.
+	return s == ""
 }
 
 // decodeState represents the state while decoding a JSON value.
 type decodeState struct {
-	data       []byte
-	off        int // read offset in data
-	scan       scanner
-	nextscan   scanner // for calls to nextValue
-	savedError error
-	tempstr    string // scratch space to avoid some allocations
-	useNumber  bool
+	data     []byte
+	off      int // read offset in data
+	scan     scanner
+	nextscan scanner // for calls to nextValue
+
+	savedError            error
+	useNumber             bool
+	disallowUnknownFields bool
 }
 
 // errPhase is used for errors that should not happen unless
@@ -191,14 +326,22 @@ func (d *decodeState) init(data []byte) *decodeState {
 
 // error aborts the decoding by panicking with err.
 func (d *decodeState) error(err error) {
-	panic(err)
+	if e := unmarshalErrHandlerHook(err); e != nil {
+		panic(err)
+	} else {
+		d.savedError = e
+	}
 }
 
 // saveError saves the first err it is called with,
 // for reporting at the end of the unmarshal.
 func (d *decodeState) saveError(err error) {
-	if d.savedError == nil {
-		d.savedError = err
+	if e := unmarshalErrHandlerHook(err); e == nil {
+		d.savedError = e
+	} else {
+		if d.savedError == nil {
+			d.savedError = err
+		}
 	}
 }
 
@@ -224,19 +367,6 @@ func (d *decodeState) next() []byte {
 	return item
 }
 
-func (d *decodeState) scanInlineComment() int {
-	var newOp int
-	for {
-		c := int(d.data[d.off])
-		d.off++
-		newOp = d.scan.step(&d.scan, c)
-		if newOp != scanSkipInComment {
-			break
-		}
-	}
-	return newOp
-}
-
 // scanWhile processes bytes in d.data[d.off:] until it
 // receives a scan code not equal to op.
 // It updates d.off and returns the new scan code.
@@ -247,12 +377,9 @@ func (d *decodeState) scanWhile(op int) int {
 			newOp = d.scan.eof()
 			d.off = len(d.data) + 1 // mark processed EOF with len+1
 		} else {
-			c := int(d.data[d.off])
+			c := d.data[d.off]
 			d.off++
 			newOp = d.scan.step(&d.scan, c)
-		}
-		if newOp == scanSkipInComment {
-			continue
 		}
 		if newOp != op {
 			break
@@ -306,8 +433,33 @@ func (d *decodeState) value(v reflect.Value) {
 
 	case scanBeginLiteral:
 		d.literal(v)
-
 	}
+}
+
+type unquotedValue struct{}
+
+// valueQuoted is like value but decodes a
+// quoted string literal or literal null into an interface value.
+// If it finds anything other than a quoted string literal or null,
+// valueQuoted returns unquotedValue{}.
+func (d *decodeState) valueQuoted() interface{} {
+	switch op := d.scanWhile(scanSkipSpace); op {
+	default:
+		d.error(errPhase)
+
+	case scanBeginArray:
+		d.array(reflect.Value{})
+
+	case scanBeginObject:
+		d.object(reflect.Value{})
+
+	case scanBeginLiteral:
+		switch v := d.literalInterface().(type) {
+		case nil, string:
+			return v
+		}
+	}
+	return unquotedValue{}
 }
 
 // indirect walks down v allocating pointers as needed,
@@ -369,7 +521,7 @@ func (d *decodeState) array(v reflect.Value) {
 		return
 	}
 	if ut != nil {
-		d.saveError(&UnmarshalTypeError{"array", v.Type()})
+		d.saveError(&UnmarshalTypeError{"array", v.Type(), int64(d.off)})
 		d.off--
 		d.next()
 		return
@@ -388,7 +540,7 @@ func (d *decodeState) array(v reflect.Value) {
 		// Otherwise it's invalid.
 		fallthrough
 	default:
-		d.saveError(&UnmarshalTypeError{"array", v.Type()})
+		d.saveError(&UnmarshalTypeError{"array", v.Type(), int64(d.off)})
 		d.off--
 		d.next()
 		return
@@ -447,7 +599,7 @@ func (d *decodeState) array(v reflect.Value) {
 
 	if i < v.Len() {
 		if v.Kind() == reflect.Array {
-			// Array.  Zero the rest.
+			// Array. Zero the rest.
 			z := reflect.Zero(v.Type().Elem())
 			for ; i < v.Len(); i++ {
 				v.Index(i).Set(z)
@@ -461,8 +613,11 @@ func (d *decodeState) array(v reflect.Value) {
 	}
 }
 
+var nullLiteral = []byte("null")
+var textUnmarshalerType = reflect.TypeOf(new(encoding.TextUnmarshaler)).Elem()
+
 // object consumes an object from d.data[d.off-1:], decoding into the value v.
-// the first byte of the object ('{') has been read already.
+// the first byte ('{') of the object has been read already.
 func (d *decodeState) object(v reflect.Value) {
 	// Check for unmarshaler.
 	u, ut, pv := d.indirect(v, false)
@@ -475,7 +630,7 @@ func (d *decodeState) object(v reflect.Value) {
 		return
 	}
 	if ut != nil {
-		d.saveError(&UnmarshalTypeError{"object", v.Type()})
+		d.saveError(&UnmarshalTypeError{"object", v.Type(), int64(d.off)})
 		d.off--
 		d.next() // skip over { } in input
 		return
@@ -488,14 +643,19 @@ func (d *decodeState) object(v reflect.Value) {
 		return
 	}
 
-	// Check type of target: struct or map[string]T
+	// Check type of target:
+	//   struct or
+	//   map[string]T or map[encoding.TextUnmarshaler]T
 	switch v.Kind() {
 	case reflect.Map:
-		// map must have string kind
+		// Map key must either have string kind or be an encoding.TextUnmarshaler.
 		t := v.Type()
-		if t.Key().Kind() != reflect.String {
-			d.saveError(&UnmarshalTypeError{"object", v.Type()})
-			break
+		if t.Key().Kind() != reflect.String &&
+			!reflect.PtrTo(t.Key()).Implements(textUnmarshalerType) {
+			d.saveError(&UnmarshalTypeError{"object", v.Type(), int64(d.off)})
+			d.off--
+			d.next() // skip over { } in input
+			return
 		}
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(t))
@@ -503,7 +663,7 @@ func (d *decodeState) object(v reflect.Value) {
 	case reflect.Struct:
 
 	default:
-		d.saveError(&UnmarshalTypeError{"object", v.Type()})
+		d.saveError(&UnmarshalTypeError{"object", v.Type(), int64(d.off)})
 		d.off--
 		d.next() // skip over { } in input
 		return
@@ -525,17 +685,13 @@ func (d *decodeState) object(v reflect.Value) {
 		// Read key.
 		start := d.off - 1
 		op = d.scanWhile(scanContinue)
-		item := d.data[start : d.off-1]
-		key := item
-		if item[0] == '"' {
-			k, ok := unquoteBytes(item)
+		key := d.data[start : d.off-1]
+		if key[0] == '"' || key[0] == '\'' {
+			var ok bool
+			key, ok = unquoteBytes(key)
 			if !ok {
 				d.error(errPhase)
 			}
-			key = k
-		}
-		if item[0] != '"' {
-			key = []byte(strings.Trim(string(key), " "))
 		}
 
 		// Figure out field corresponding to key.
@@ -575,6 +731,8 @@ func (d *decodeState) object(v reflect.Value) {
 					}
 					subv = subv.Field(i)
 				}
+			} else if d.disallowUnknownFields {
+				d.saveError(fmt.Errorf("json: unknown field %q", key))
 			}
 		}
 
@@ -588,9 +746,14 @@ func (d *decodeState) object(v reflect.Value) {
 
 		// Read value.
 		if destring {
-			d.value(reflect.ValueOf(&d.tempstr))
-			d.literalStore([]byte(d.tempstr), subv, true)
-			d.tempstr = "" // Zero scratch space for successive values.
+			switch qv := d.valueQuoted().(type) {
+			case nil:
+				d.literalStore(nullLiteral, subv, false, false)
+			case string:
+				d.literalStore([]byte(qv), subv, true, false)
+			default:
+				d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal unquoted value into %v", subv.Type()))
+			}
 		} else {
 			d.value(subv)
 		}
@@ -598,7 +761,18 @@ func (d *decodeState) object(v reflect.Value) {
 		// Write value back to map;
 		// if using struct, subv points into struct already.
 		if v.Kind() == reflect.Map {
-			kv := reflect.ValueOf(key).Convert(v.Type().Key())
+			kt := v.Type().Key()
+			var kv reflect.Value
+			switch {
+			case kt.Kind() == reflect.String:
+				kv = reflect.ValueOf(key).Convert(v.Type().Key())
+			case reflect.PtrTo(kt).Implements(textUnmarshalerType):
+				kv = reflect.New(v.Type().Key())
+				d.literalStore(key, kv, true, true)
+				kv = kv.Elem()
+			default:
+				panic("json: Unexpected key type") // should never occur
+			}
 			v.SetMapIndex(kv, subv)
 		}
 
@@ -625,7 +799,7 @@ func (d *decodeState) literal(v reflect.Value) {
 	d.off--
 	d.scan.undo(op)
 
-	d.literalStore(d.data[start:d.off], v, false)
+	d.literalStore(d.data[start:d.off], v, false, false)
 }
 
 // convertNumber converts the number literal s to a float64 or a Number
@@ -634,11 +808,35 @@ func (d *decodeState) convertNumber(s string) (interface{}, error) {
 	if d.useNumber {
 		return Number(s), nil
 	}
+	if h, ok := hexString(s); ok {
+		n, err := strconv.ParseInt(h, 16, 64)
+		if err != nil {
+			return nil, &UnmarshalTypeError{"number " + s, reflect.TypeOf(0.0), int64(d.off)}
+		}
+		f := float64(n)
+		if h[0] == '-' && n == 0 {
+			f = -f
+		}
+		return f, nil
+	}
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return nil, &UnmarshalTypeError{"number " + s, reflect.TypeOf(0.0)}
+		return nil, &UnmarshalTypeError{"number " + s, reflect.TypeOf(0.0), int64(d.off)}
 	}
 	return f, nil
+}
+
+func hexString(s string) (res string, ok bool) {
+	if len(s) < 3 {
+		return
+	}
+	if len(s) > 3 && (s[0] == '-' || s[0] == '+') && s[1] == '0' && (s[2] == 'x' || s[2] == 'X') {
+		return s[:1] + s[3:], true
+	}
+	if s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		return s[2:], true
+	}
+	return
 }
 
 var numberType = reflect.TypeOf(Number(""))
@@ -648,16 +846,19 @@ var numberType = reflect.TypeOf(Number(""))
 // fromQuoted indicates whether this literal came from unwrapping a
 // string from the ",string" struct tag option. this is used only to
 // produce more helpful error messages.
-func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool) {
+func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted, unquotedString bool) {
 	// Check for unmarshaler.
 	if len(item) == 0 {
-		//Empty string given
+		// Empty string given
 		d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
 		return
 	}
 	wantptr := item[0] == 'n' // null
 	u, ut, pv := d.indirect(v, wantptr)
 	if u != nil {
+		if unquotedString {
+			item = append(append([]byte{'"'}, item...), '"')
+		}
 		err := u.UnmarshalJSON(item)
 		if err != nil {
 			d.error(err)
@@ -665,19 +866,24 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 		return
 	}
 	if ut != nil {
-		if item[0] != '"' {
-			if fromQuoted {
-				d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
-			} else {
-				d.saveError(&UnmarshalTypeError{"string", v.Type()})
+		s := item
+		if !unquotedString {
+			if item[0] != '"' && item[0] != '\'' {
+				if fromQuoted {
+					d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
+				} else {
+					d.saveError(&UnmarshalTypeError{"string", v.Type(), int64(d.off)})
+				}
+				return
 			}
-		}
-		s, ok := unquoteBytes(item)
-		if !ok {
-			if fromQuoted {
-				d.error(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
-			} else {
-				d.error(errPhase)
+			var ok bool
+			s, ok = unquoteBytes(item)
+			if !ok {
+				if fromQuoted {
+					d.error(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
+				} else {
+					d.error(errPhase)
+				}
 			}
 		}
 		err := ut.UnmarshalText(s)
@@ -689,7 +895,11 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 
 	v = pv
 
-	switch c := item[0]; c {
+	c := item[0]
+	if unquotedString {
+		c = '"'
+	}
+	switch c {
 	case 'n': // null
 		switch v.Kind() {
 		case reflect.Interface, reflect.Ptr, reflect.Map, reflect.Slice:
@@ -703,7 +913,7 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 			if fromQuoted {
 				d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
 			} else {
-				d.saveError(&UnmarshalTypeError{"bool", v.Type()})
+				d.saveError(&UnmarshalTypeError{"bool", v.Type(), int64(d.off)})
 			}
 		case reflect.Bool:
 			v.SetBool(value)
@@ -711,46 +921,94 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 			if v.NumMethod() == 0 {
 				v.Set(reflect.ValueOf(value))
 			} else {
-				d.saveError(&UnmarshalTypeError{"bool", v.Type()})
+				d.saveError(&UnmarshalTypeError{"bool", v.Type(), int64(d.off)})
 			}
 		}
 
-	case '"': // string
-		s, ok := unquoteBytes(item)
-		if !ok {
-			if fromQuoted {
-				d.error(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
-			} else {
-				d.error(errPhase)
+	case '"', '\'': // string
+		s := string(item)
+		if !unquotedString {
+			ss, ok := unquoteBytes([]byte(item))
+			if !ok {
+				if fromQuoted {
+					d.error(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
+				} else {
+					d.error(errPhase)
+				}
 			}
+			s = string(ss)
 		}
 		switch v.Kind() {
 		default:
-			d.saveError(&UnmarshalTypeError{"string", v.Type()})
+			d.saveError(&UnmarshalTypeError{"string", v.Type(), int64(d.off)})
 		case reflect.Slice:
-			if v.Type() != byteSliceType {
-				d.saveError(&UnmarshalTypeError{"string", v.Type()})
+			if v.Type().Elem().Kind() != reflect.Uint8 {
+				d.saveError(&UnmarshalTypeError{"string", v.Type(), int64(d.off)})
 				break
 			}
 			b := make([]byte, base64.StdEncoding.DecodedLen(len(s)))
-			n, err := base64.StdEncoding.Decode(b, s)
+			n, err := base64.StdEncoding.Decode(b, []byte(s))
 			if err != nil {
 				d.saveError(err)
 				break
 			}
-			v.Set(reflect.ValueOf(b[0:n]))
+			v.SetBytes(b[:n])
 		case reflect.String:
 			v.SetString(string(s))
 		case reflect.Interface:
 			if v.NumMethod() == 0 {
 				v.Set(reflect.ValueOf(string(s)))
 			} else {
-				d.saveError(&UnmarshalTypeError{"string", v.Type()})
+				d.saveError(&UnmarshalTypeError{"string", v.Type(), int64(d.off)})
 			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			var n int64
+			var err error
+			if h, ok := hexString(s); ok {
+				n, err = strconv.ParseInt(h, 16, 64)
+			} else {
+				n, err = strconv.ParseInt(s, 10, 64)
+			}
+			if err != nil || v.OverflowInt(n) {
+				d.saveError(&UnmarshalTypeError{"number " + s, v.Type(), int64(d.off)})
+				break
+			}
+			v.SetInt(n)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			var n uint64
+			var err error
+			if h, ok := hexString(s); ok {
+				n, err = strconv.ParseUint(h, 16, 64)
+			} else {
+				n, err = strconv.ParseUint(s, 10, 64)
+			}
+			if err != nil || v.OverflowUint(n) {
+				d.saveError(&UnmarshalTypeError{"number " + s, v.Type(), int64(d.off)})
+				break
+			}
+			v.SetUint(n)
+		case reflect.Float32, reflect.Float64:
+			var n float64
+			var err error
+			if h, ok := hexString(s); ok {
+				var nn int64
+				nn, err = strconv.ParseInt(h, 16, 64)
+				n = float64(nn)
+				if s[0] == '-' && nn == 0 {
+					n = -n
+				}
+			} else {
+				n, err = strconv.ParseFloat(s, v.Type().Bits())
+			}
+			if err != nil || v.OverflowFloat(n) {
+				d.saveError(&UnmarshalTypeError{"number " + s, v.Type(), int64(d.off)})
+				break
+			}
+			v.SetFloat(n)
 		}
 
 	default: // number
-		if c != '-' && (c < '0' || c > '9') {
+		if c != '-' && c != '+' && c != '.' && c != 'I' && c != 'N' && (c < '0' || c > '9') {
 			if fromQuoted {
 				d.error(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
 			} else {
@@ -762,12 +1020,15 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 		default:
 			if v.Kind() == reflect.String && v.Type() == numberType {
 				v.SetString(s)
+				if !isValidNumber(s) {
+					d.error(fmt.Errorf("json: invalid number literal, trying to unmarshal %q into Number", item))
+				}
 				break
 			}
 			if fromQuoted {
 				d.error(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
 			} else {
-				d.error(&UnmarshalTypeError{"number", v.Type()})
+				d.error(&UnmarshalTypeError{"number", v.Type(), int64(d.off)})
 			}
 		case reflect.Interface:
 			n, err := d.convertNumber(s)
@@ -776,31 +1037,54 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 				break
 			}
 			if v.NumMethod() != 0 {
-				d.saveError(&UnmarshalTypeError{"number", v.Type()})
+				d.saveError(&UnmarshalTypeError{"number", v.Type(), int64(d.off)})
 				break
 			}
 			v.Set(reflect.ValueOf(n))
 
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			n, err := strconv.ParseInt(s, 10, 64)
+			var n int64
+			var err error
+			if h, ok := hexString(s); ok {
+				n, err = strconv.ParseInt(h, 16, 64)
+			} else {
+				n, err = strconv.ParseInt(s, 10, 64)
+			}
 			if err != nil || v.OverflowInt(n) {
-				d.saveError(&UnmarshalTypeError{"number " + s, v.Type()})
+				d.saveError(&UnmarshalTypeError{"number " + s, v.Type(), int64(d.off)})
 				break
 			}
 			v.SetInt(n)
 
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			n, err := strconv.ParseUint(s, 10, 64)
+			var n uint64
+			var err error
+			if h, ok := hexString(s); ok {
+				n, err = strconv.ParseUint(h, 16, 64)
+			} else {
+				n, err = strconv.ParseUint(s, 10, 64)
+			}
 			if err != nil || v.OverflowUint(n) {
-				d.saveError(&UnmarshalTypeError{"number " + s, v.Type()})
+				d.saveError(&UnmarshalTypeError{"number " + s, v.Type(), int64(d.off)})
 				break
 			}
 			v.SetUint(n)
 
 		case reflect.Float32, reflect.Float64:
-			n, err := strconv.ParseFloat(s, v.Type().Bits())
+			var n float64
+			var err error
+			if h, ok := hexString(s); ok {
+				var nn int64
+				nn, err = strconv.ParseInt(h, 16, 64)
+				n = float64(nn)
+				if s[0] == '-' && nn == 0 {
+					n = -n
+				}
+			} else {
+				n, err = strconv.ParseFloat(s, v.Type().Bits())
+			}
 			if err != nil || v.OverflowFloat(n) {
-				d.saveError(&UnmarshalTypeError{"number " + s, v.Type()})
+				d.saveError(&UnmarshalTypeError{"number " + s, v.Type(), int64(d.off)})
 				break
 			}
 			v.SetFloat(n)
@@ -809,7 +1093,7 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 }
 
 // The xxxInterface routines build up a value to be stored
-// in an empty interface.  They are not strictly necessary,
+// in an empty interface. They are not strictly necessary,
 // but they avoid the weight of reflection in this common case.
 
 // valueInterface is like value but returns interface{}
@@ -872,17 +1156,13 @@ func (d *decodeState) objectInterface() map[string]interface{} {
 		// Read string key.
 		start := d.off - 1
 		op = d.scanWhile(scanContinue)
-		item := d.data[start : d.off-1]
-		key := string(item)
-		if item[0] == '"' {
-			k, ok := unquote(item)
+		key := d.data[start : d.off-1]
+		if key[0] == '"' || key[0] == '\'' {
+			var ok bool
+			key, ok = unquoteBytes(key)
 			if !ok {
 				d.error(errPhase)
 			}
-			key = k
-		}
-		if item[0] != '"' {
-			key = strings.Trim(key, " ")
 		}
 
 		// Read : before value.
@@ -894,7 +1174,7 @@ func (d *decodeState) objectInterface() map[string]interface{} {
 		}
 
 		// Read value.
-		m[key] = d.valueInterface()
+		m[string(key)] = d.valueInterface()
 
 		// Next token must be , or }.
 		op = d.scanWhile(scanSkipSpace)
@@ -926,7 +1206,13 @@ func (d *decodeState) literalInterface() interface{} {
 	case 't', 'f': // true, false
 		return c == 't'
 
-	case '"': // string
+	case 'I': // Infinity
+		return math.Inf(0)
+
+	case 'N': // NaN
+		return math.NaN()
+
+	case '"', '\'': // string
 		s, ok := unquote(item)
 		if !ok {
 			d.error(errPhase)
@@ -934,8 +1220,14 @@ func (d *decodeState) literalInterface() interface{} {
 		return s
 
 	default: // number
-		if c != '-' && c != '.' && (c < '0' || c > '9') {
+		if c != '-' && c != '+' && c != '.' && (c < '0' || c > '9') {
 			d.error(errPhase)
+		}
+		if c == '-' && item[1] == 'I' {
+			return math.Inf(-1)
+		}
+		if c == '+' && item[1] == 'I' {
+			return math.Inf(+1)
 		}
 		n, err := d.convertNumber(string(item))
 		if err != nil {
@@ -967,9 +1259,10 @@ func unquote(s []byte) (t string, ok bool) {
 }
 
 func unquoteBytes(s []byte) (t []byte, ok bool) {
-	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+	if len(s) < 2 || (s[0] != '"' && s[0] != '\'') || (s[len(s)-1] != '"' && s[len(s)-1] != '\'') {
 		return
 	}
+	orig := s
 	s = s[1 : len(s)-1]
 
 	// Check for unusual characters. If there are none,
@@ -978,7 +1271,7 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 	r := 0
 	for r < len(s) {
 		c := s[r]
-		if c == '\\' || c == '"' || c < ' ' {
+		if c == '\\' || c == '"' || c == '\'' || c < ' ' {
 			break
 		}
 		if c < utf8.RuneSelf {
@@ -1023,6 +1316,13 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 				b[w] = '\b'
 				r++
 				w++
+			case '\n':
+				r++
+			case '\r':
+				r++
+				if r < len(s) && s[r] == '\n' {
+					r++
+				}
 			case 'f':
 				b[w] = '\f'
 				r++
@@ -1061,7 +1361,7 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 			}
 
 		// Quote, control characters are invalid.
-		case c == '"', c < ' ':
+		case orig[0] == '"' && c == '"', orig[0] == '\'' && c == '\'', c < ' ':
 			return
 
 		// ASCII

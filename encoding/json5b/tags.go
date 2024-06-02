@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// tagOptions is the string following a comma in a struct field's "json"
+// tagOptions is the string following a comma in a struct field's "json5"
 // tag, or the empty string. It does not include the leading comma.
 type tagOptions string
 

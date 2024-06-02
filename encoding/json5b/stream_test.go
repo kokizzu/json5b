@@ -1,4 +1,4 @@
-// Copyright 2010 The Go Authors.  All rights reserved.
+// Copyright 2010 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -35,23 +35,6 @@ false
 {"ß":"long s","K":"Kelvin"}
 3.14
 `
-
-func TestEncoder(t *testing.T) {
-	for i := 0; i <= len(streamTest); i++ {
-		var buf bytes.Buffer
-		enc := NewEncoder(&buf)
-		for j, v := range streamTest[0:i] {
-			if err := enc.Encode(v); err != nil {
-				t.Fatalf("encode #%d: %v", j, err)
-			}
-		}
-		if have, want := buf.String(), nlines(streamEncoded, i); have != want {
-			t.Errorf("encoding %d items: mismatch", i)
-			diff(t, []byte(have), []byte(want))
-			break
-		}
-	}
-}
 
 func TestDecoder(t *testing.T) {
 	for i := 0; i <= len(streamTest); i++ {
@@ -137,13 +120,6 @@ func TestRawMessage(t *testing.T) {
 	if string([]byte(*data.Id)) != raw {
 		t.Fatalf("Raw mismatch: have %#q want %#q", []byte(*data.Id), raw)
 	}
-	b, err := Marshal(&data)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if string(b) != msg {
-		t.Fatalf("Marshal: have %#q want %#q", b, msg)
-	}
 }
 
 func TestNullRawMessage(t *testing.T) {
@@ -161,13 +137,6 @@ func TestNullRawMessage(t *testing.T) {
 	}
 	if data.Id != nil {
 		t.Fatalf("Raw mismatch: have non-nil, want nil")
-	}
-	b, err := Marshal(&data)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if string(b) != msg {
-		t.Fatalf("Marshal: have %#q want %#q", b, msg)
 	}
 }
 
@@ -189,18 +158,5 @@ func TestBlocking(t *testing.T) {
 		}
 		r.Close()
 		w.Close()
-	}
-}
-
-func BenchmarkEncoderEncode(b *testing.B) {
-	b.ReportAllocs()
-	type T struct {
-		X, Y string
-	}
-	v := &T{"foo", "bar"}
-	for i := 0; i < b.N; i++ {
-		if err := NewEncoder(ioutil.Discard).Encode(v); err != nil {
-			b.Fatal(err)
-		}
 	}
 }

@@ -7,23 +7,40 @@ package json5b
 import (
 	"bytes"
 	"encoding"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
+// Ref has Marshaler and Unmarshaler methods with pointer receiver.
+type Ref int
+
+func (r *Ref) UnmarshalJSON([]byte) error {
+	*r = 12
+	return nil
+}
+
+// RefText has Marshaler and Unmarshaler methods with pointer receiver.
+type RefText int
+
+func (r *RefText) UnmarshalText([]byte) error {
+	*r = 13
+	return nil
+}
+
 type T struct {
 	X string
 	Y int
-	Z int `json5:"-"`
+	Z int `json:"-"`
 }
 
 type U struct {
-	Alphabet string `json5:"alpha"`
+	Alphabet string `json:"alpha"`
 }
 
 type V struct {
@@ -68,16 +85,15 @@ type ustruct struct {
 }
 
 type unmarshalerText struct {
-	T bool
-}
-
-// needed for re-marshaling tests
-func (u *unmarshalerText) MarshalText() ([]byte, error) {
-	return []byte(""), nil
+	A, B string
 }
 
 func (u *unmarshalerText) UnmarshalText(b []byte) error {
-	*u = unmarshalerText{true} // All we need to see that UnmarshalText is called.
+	pos := bytes.Index(b, []byte(":"))
+	if pos == -1 {
+		return errors.New("missing separator")
+	}
+	u.A, u.B = string(b[:pos]), string(b[pos+1:])
 	return nil
 }
 
@@ -95,12 +111,16 @@ var (
 	umslicep = new([]unmarshaler)
 	umstruct = ustruct{unmarshaler{true}}
 
-	um0T, um1T unmarshalerText // target2 of unmarshaling
-	umpT       = &um1T
-	umtrueT    = unmarshalerText{true}
-	umsliceT   = []unmarshalerText{{true}}
-	umslicepT  = new([]unmarshalerText)
-	umstructT  = ustructText{unmarshalerText{true}}
+	um0T, um1T   unmarshalerText // target2 of unmarshaling
+	umpType      = &um1T
+	umtrueXY     = unmarshalerText{"x", "y"}
+	umsliceXY    = []unmarshalerText{{"x", "y"}}
+	umslicepType = new([]unmarshalerText)
+	umstructType = new(ustructText)
+	umstructXY   = ustructText{unmarshalerText{"x", "y"}}
+
+	ummapType = map[unmarshalerText]bool{}
+	ummapXY   = map[unmarshalerText]bool{unmarshalerText{"x", "y"}: true}
 )
 
 // Test data structures for anonymous fields.
@@ -113,11 +133,12 @@ type Top struct {
 	Level0 int
 	Embed0
 	*Embed0a
-	*Embed0b `json5:"e,omitempty"` // treated as named
-	Embed0c  `json5:"-"`           // ignored
+	*Embed0b `json:"e,omitempty"` // treated as named
+	Embed0c  `json:"-"`           // ignored
 	Loop
 	Embed0p // has Point with X, Y, used
 	Embed0q // has Point with Z, used
+	embed   // contains exported field
 }
 
 type Embed0 struct {
@@ -125,15 +146,15 @@ type Embed0 struct {
 	Level1b int // used because Embed0a's Level1b is renamed
 	Level1c int // used because Embed0a's Level1c is ignored
 	Level1d int // annihilated by Embed0a's Level1d
-	Level1e int `json5:"x"` // annihilated by Embed0a.Level1e
+	Level1e int `json:"x"` // annihilated by Embed0a.Level1e
 }
 
 type Embed0a struct {
-	Level1a int `json5:"Level1a,omitempty"`
-	Level1b int `json5:"LEVEL1B,omitempty"`
-	Level1c int `json5:"-"`
+	Level1a int `json:"Level1a,omitempty"`
+	Level1b int `json:"LEVEL1B,omitempty"`
+	Level1c int `json:"-"`
 	Level1d int // annihilated by Embed0's Level1d
-	Level1f int `json5:"x"` // annihilated by Embed0's Level1e
+	Level1f int `json:"x"` // annihilated by Embed0's Level1e
 }
 
 type Embed0b Embed0
@@ -148,9 +169,13 @@ type Embed0q struct {
 	Point
 }
 
+type embed struct {
+	Q int
+}
+
 type Loop struct {
-	Loop1 int `json5:",omitempty"`
-	Loop2 int `json5:",omitempty"`
+	Loop1 int `json:",omitempty"`
+	Loop2 int `json:",omitempty"`
 	*Loop
 }
 
@@ -198,17 +223,18 @@ type S13 struct {
 }
 
 type unmarshalTest struct {
-	in        string
-	ptr       interface{}
-	out       interface{}
-	err       error
-	useNumber bool
+	in                    string
+	ptr                   interface{}
+	out                   interface{}
+	err                   error
+	useNumber             bool
+	disallowUnknownFields bool
 }
 
 type Ambig struct {
 	// Given "hello", the first match should win.
-	First  int `json5:"HELLO"`
-	Second int `json5:"Hello"`
+	First  int `json:"HELLO"`
+	Second int `json:"Hello"`
 }
 
 type XYZ struct {
@@ -216,6 +242,9 @@ type XYZ struct {
 	Y interface{}
 	Z interface{}
 }
+
+func sliceAddr(x []int) *[]int                 { return &x }
+func mapAddr(x map[string]int) *map[string]int { return &x }
 
 var unmarshalTests = []unmarshalTest{
 	// basic types
@@ -232,8 +261,9 @@ var unmarshalTests = []unmarshalTest{
 	{in: `"g-clef: \uD834\uDD1E"`, ptr: new(string), out: "g-clef: \U0001D11E"},
 	{in: `"invalid: \uD834x\uDD1E"`, ptr: new(string), out: "invalid: \uFFFDx\uFFFD"},
 	{in: "null", ptr: new(interface{}), out: nil},
-	{in: `{"X": [1,2,3], "Y": 4}`, ptr: new(T), out: T{Y: 4}, err: &UnmarshalTypeError{"array", reflect.TypeOf("")}},
+	{in: `{"X": [1,2,3], "Y": 4}`, ptr: new(T), out: T{Y: 4}, err: &UnmarshalTypeError{"array", reflect.TypeOf(""), 7}},
 	{in: `{"x": 1}`, ptr: new(tx), out: tx{}},
+	{in: `{"x": 1}`, ptr: new(tx), err: fmt.Errorf("json: unknown field \"x\""), disallowUnknownFields: true},
 	{in: `{"F1":1,"F2":2,"F3":3}`, ptr: new(V), out: V{F1: float64(1), F2: int32(2), F3: Number("3")}},
 	{in: `{"F1":1,"F2":2,"F3":3}`, ptr: new(V), out: V{F1: Number("1"), F2: int32(2), F3: Number("3")}, useNumber: true},
 	{in: `{"k1":1,"k2":"s","k3":[1,2.0,3e-3],"k4":{"kk1":"s","kk2":2}}`, ptr: new(interface{}), out: ifaceNumAsFloat64},
@@ -248,10 +278,13 @@ var unmarshalTests = []unmarshalTest{
 
 	// Z has a "-" tag.
 	{in: `{"Y": 1, "Z": 2}`, ptr: new(T), out: T{Y: 1}},
+	{in: `{"Y": 1, "Z": 2}`, ptr: new(T), err: fmt.Errorf("json: unknown field \"Z\""), disallowUnknownFields: true},
 
 	{in: `{"alpha": "abc", "alphabet": "xyz"}`, ptr: new(U), out: U{Alphabet: "abc"}},
+	{in: `{"alpha": "abc", "alphabet": "xyz"}`, ptr: new(U), err: fmt.Errorf("json: unknown field \"alphabet\""), disallowUnknownFields: true},
 	{in: `{"alpha": "abc"}`, ptr: new(U), out: U{Alphabet: "abc"}},
 	{in: `{"alphabet": "xyz"}`, ptr: new(U), out: U{}},
+	{in: `{"alphabet": "xyz"}`, ptr: new(U), err: fmt.Errorf("json: unknown field \"alphabet\""), disallowUnknownFields: true},
 
 	// syntax errors
 	{in: `{"X": "foo", "Y"}`, err: &SyntaxError{"invalid character '}' after object key", 17}},
@@ -294,14 +327,25 @@ var unmarshalTests = []unmarshalTest{
 	{in: `{"T":false}`, ptr: &ump, out: &umtrue},
 	{in: `[{"T":false}]`, ptr: &umslice, out: umslice},
 	{in: `[{"T":false}]`, ptr: &umslicep, out: &umslice},
-	{in: `{"M":{"T":false}}`, ptr: &umstruct, out: umstruct},
+	{in: `{"M":{"T":"x:y"}}`, ptr: &umstruct, out: umstruct},
 
 	// UnmarshalText interface test
-	{in: `"X"`, ptr: &um0T, out: umtrueT}, // use "false" so test will fail if custom unmarshaler is not called
-	{in: `"X"`, ptr: &umpT, out: &umtrueT},
-	{in: `["X"]`, ptr: &umsliceT, out: umsliceT},
-	{in: `["X"]`, ptr: &umslicepT, out: &umsliceT},
-	{in: `{"M":"X"}`, ptr: &umstructT, out: umstructT},
+	{in: `"x:y"`, ptr: &um0T, out: umtrueXY},
+	{in: `"x:y"`, ptr: &umpType, out: &umtrueXY},
+	{in: `["x:y"]`, ptr: &umsliceXY, out: umsliceXY},
+	{in: `["x:y"]`, ptr: &umslicepType, out: &umsliceXY},
+	{in: `{"M":"x:y"}`, ptr: umstructType, out: umstructXY},
+
+	// Map keys can be encoding.TextUnmarshalers
+	{in: `{"x:y":true}`, ptr: &ummapType, out: ummapXY},
+	// If multiple values for the same key exists, only the most recent value is used.
+	{in: `{"x:y":false,"x:y":true}`, ptr: &ummapType, out: ummapXY},
+
+	// Overwriting of data.
+	// This is different from package xml, but it's what we've always done.
+	// Now documented and tested.
+	{in: `[2]`, ptr: sliceAddr([]int{1}), out: []int{2}},
+	{in: `{"key": 2}`, ptr: mapAddr(map[string]int{"old": 0, "key": 1}), out: map[string]int{"key": 2}},
 
 	{
 		in: `{
@@ -322,7 +366,8 @@ var unmarshalTests = []unmarshalTest{
 			"Loop2": 14,
 			"X": 15,
 			"Y": 16,
-			"Z": 17
+			"Z": 17,
+			"Q": 18
 		}`,
 		ptr: new(Top),
 		out: Top{
@@ -352,6 +397,9 @@ var unmarshalTests = []unmarshalTest{
 			Embed0q: Embed0q{
 				Point: Point{Z: 17},
 			},
+			embed: embed{
+				Q: 18,
+			},
 		},
 	},
 	{
@@ -366,9 +414,21 @@ var unmarshalTests = []unmarshalTest{
 		out: S5{S8: S8{S9: S9{Y: 2}}},
 	},
 	{
+		in:                    `{"X": 1,"Y":2}`,
+		ptr:                   new(S5),
+		err:                   fmt.Errorf("json: unknown field \"X\""),
+		disallowUnknownFields: true,
+	},
+	{
 		in:  `{"X": 1,"Y":2}`,
 		ptr: new(S10),
 		out: S10{S13: S13{S8: S8{S9: S9{Y: 2}}}},
+	},
+	{
+		in:                    `{"X": 1,"Y":2}`,
+		ptr:                   new(S10),
+		err:                   fmt.Errorf("json: unknown field \"X\""),
+		disallowUnknownFields: true,
 	},
 
 	// invalid UTF-8 is coerced to valid UTF-8.
@@ -407,28 +467,81 @@ var unmarshalTests = []unmarshalTest{
 		ptr: new(string),
 		out: "hello\ufffd\ufffd\ufffd\ufffd\ufffd\ufffdworld",
 	},
-}
 
-func TestMarshal(t *testing.T) {
-	b, err := Marshal(allValue)
-	if err != nil {
-		t.Fatalf("Marshal allValue: %v", err)
-	}
-	if string(b) != allValueCompact {
-		t.Errorf("Marshal allValueCompact")
-		diff(t, b, []byte(allValueCompact))
-		return
-	}
+	// Used to be issue 8305, but time.Time implements encoding.TextUnmarshaler so this works now.
+	{
+		in:  `{"2009-11-10T23:00:00Z": "hello world"}`,
+		ptr: &map[time.Time]string{},
+		out: map[time.Time]string{time.Date(2009, 11, 10, 23, 0, 0, 0, time.UTC): "hello world"},
+	},
 
-	b, err = Marshal(pallValue)
-	if err != nil {
-		t.Fatalf("Marshal pallValue: %v", err)
-	}
-	if string(b) != pallValueCompact {
-		t.Errorf("Marshal pallValueCompact")
-		diff(t, b, []byte(pallValueCompact))
-		return
-	}
+	// issue 8305
+	{
+		in:  `{"2009-11-10T23:00:00Z": "hello world"}`,
+		ptr: &map[Point]string{},
+		err: &UnmarshalTypeError{"object", reflect.TypeOf(map[Point]string{}), 1},
+	},
+	{
+		in:  `{"asdf": "hello world"}`,
+		ptr: &map[unmarshaler]string{},
+		err: &UnmarshalTypeError{"object", reflect.TypeOf(map[unmarshaler]string{}), 1},
+	},
+
+	// additional tests for disallowUnknownFields
+	{
+		in: `{
+			"Level0": 1,
+			"Level1b": 2,
+			"Level1c": 3,
+			"x": 4,
+			"Level1a": 5,
+			"LEVEL1B": 6,
+			"e": {
+				"Level1a": 8,
+				"Level1b": 9,
+				"Level1c": 10,
+				"Level1d": 11,
+				"x": 12
+			},
+			"Loop1": 13,
+			"Loop2": 14,
+			"X": 15,
+			"Y": 16,
+			"Z": 17,
+			"Q": 18,
+			"extra": true
+		}`,
+		ptr:                   new(Top),
+		err:                   fmt.Errorf("json: unknown field \"extra\""),
+		disallowUnknownFields: true,
+	},
+	{
+		in: `{
+			"Level0": 1,
+			"Level1b": 2,
+			"Level1c": 3,
+			"x": 4,
+			"Level1a": 5,
+			"LEVEL1B": 6,
+			"e": {
+				"Level1a": 8,
+				"Level1b": 9,
+				"Level1c": 10,
+				"Level1d": 11,
+				"x": 12,
+				"extra": null
+			},
+			"Loop1": 13,
+			"Loop2": 14,
+			"X": 15,
+			"Y": 16,
+			"Z": 17,
+			"Q": 18
+		}`,
+		ptr:                   new(Top),
+		err:                   fmt.Errorf("json: unknown field \"extra\""),
+		disallowUnknownFields: true,
+	},
 }
 
 var badUTF8 = []struct {
@@ -440,66 +553,6 @@ var badUTF8 = []struct {
 	{"\xff\xff", `"\ufffd\ufffd"`},
 	{"a\xffb", `"a\ufffdb"`},
 	{"\xe6\x97\xa5\xe6\x9c\xac\xff\xaa\x9e", `"日本\ufffd\ufffd\ufffd"`},
-}
-
-func TestMarshalBadUTF8(t *testing.T) {
-	for _, tt := range badUTF8 {
-		b, err := Marshal(tt.in)
-		if string(b) != tt.out || err != nil {
-			t.Errorf("Marshal(%q) = %#q, %v, want %#q, nil", tt.in, b, err, tt.out)
-		}
-	}
-}
-
-func TestMarshalNumberZeroVal(t *testing.T) {
-	var n Number
-	out, err := Marshal(n)
-	if err != nil {
-		t.Fatal(err)
-	}
-	outStr := string(out)
-	if outStr != "0" {
-		t.Fatalf("Invalid zero val for Number: %q", outStr)
-	}
-}
-
-func TestMarshalEmbeds(t *testing.T) {
-	top := &Top{
-		Level0: 1,
-		Embed0: Embed0{
-			Level1b: 2,
-			Level1c: 3,
-		},
-		Embed0a: &Embed0a{
-			Level1a: 5,
-			Level1b: 6,
-		},
-		Embed0b: &Embed0b{
-			Level1a: 8,
-			Level1b: 9,
-			Level1c: 10,
-			Level1d: 11,
-			Level1e: 12,
-		},
-		Loop: Loop{
-			Loop1: 13,
-			Loop2: 14,
-		},
-		Embed0p: Embed0p{
-			Point: image.Point{X: 15, Y: 16},
-		},
-		Embed0q: Embed0q{
-			Point: Point{Z: 17},
-		},
-	}
-	b, err := Marshal(top)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "{\"Level0\":1,\"Level1b\":2,\"Level1c\":3,\"Level1a\":5,\"LEVEL1B\":6,\"e\":{\"Level1a\":8,\"Level1b\":9,\"Level1c\":10,\"Level1d\":11,\"x\":12},\"Loop1\":13,\"Loop2\":14,\"X\":15,\"Y\":16,\"Z\":17}"
-	if string(b) != want {
-		t.Errorf("Wrong marshal result.\n got: %q\nwant: %q", b, want)
-	}
 }
 
 func TestUnmarshal(t *testing.T) {
@@ -515,65 +568,26 @@ func TestUnmarshal(t *testing.T) {
 		if tt.ptr == nil {
 			continue
 		}
+
 		// v = new(right-type)
 		v := reflect.New(reflect.TypeOf(tt.ptr).Elem())
 		dec := NewDecoder(bytes.NewReader(in))
 		if tt.useNumber {
 			dec.UseNumber()
 		}
+		if tt.disallowUnknownFields {
+			dec.DisallowUnknownFields()
+		}
 		if err := dec.Decode(v.Interface()); !reflect.DeepEqual(err, tt.err) {
-			t.Errorf("#%d: %v want %v", i, err, tt.err)
+			t.Errorf("#%d: %v, want %v", i, err, tt.err)
+			continue
+		} else if err != nil {
 			continue
 		}
 		if !reflect.DeepEqual(v.Elem().Interface(), tt.out) {
 			t.Errorf("#%d: mismatch\nhave: %#+v\nwant: %#+v", i, v.Elem().Interface(), tt.out)
-			data, _ := Marshal(v.Elem().Interface())
-			println(string(data))
-			data, _ = Marshal(tt.out)
-			println(string(data))
 			continue
 		}
-
-		// Check round trip.
-		if tt.err == nil {
-			enc, err := Marshal(v.Interface())
-			if err != nil {
-				t.Errorf("#%d: error re-marshaling: %v", i, err)
-				continue
-			}
-			vv := reflect.New(reflect.TypeOf(tt.ptr).Elem())
-			dec = NewDecoder(bytes.NewReader(enc))
-			if tt.useNumber {
-				dec.UseNumber()
-			}
-			if err := dec.Decode(vv.Interface()); err != nil {
-				t.Errorf("#%d: error re-unmarshaling %#q: %v", i, enc, err)
-				continue
-			}
-			if !reflect.DeepEqual(v.Elem().Interface(), vv.Elem().Interface()) {
-				t.Errorf("#%d: mismatch\nhave: %#+v\nwant: %#+v", i, v.Elem().Interface(), vv.Elem().Interface())
-				t.Errorf("     In: %q", strings.Map(noSpace, string(in)))
-				t.Errorf("Marshal: %q", strings.Map(noSpace, string(enc)))
-				continue
-			}
-		}
-	}
-}
-
-func TestUnmarshalMarshal(t *testing.T) {
-	initBig()
-	var v interface{}
-	if err := Unmarshal(jsonBig, &v); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	b, err := Marshal(v)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if !bytes.Equal(jsonBig, b) {
-		t.Errorf("Marshal jsonBig")
-		diff(t, b, jsonBig)
-		return
 	}
 }
 
@@ -609,25 +623,6 @@ func TestNumberAccessors(t *testing.T) {
 	}
 }
 
-func TestLargeByteSlice(t *testing.T) {
-	s0 := make([]byte, 2000)
-	for i := range s0 {
-		s0[i] = byte(i)
-	}
-	b, err := Marshal(s0)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	var s1 []byte
-	if err := Unmarshal(b, &s1); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if !bytes.Equal(s0, s1) {
-		t.Errorf("Marshal large byte slice")
-		diff(t, s0, s1)
-	}
-}
-
 type Xint struct {
 	X int
 }
@@ -654,21 +649,9 @@ func TestUnmarshalPtrPtr(t *testing.T) {
 	}
 }
 
-func TestEscape(t *testing.T) {
-	const input = `"foobar"<html>` + " [\u2028 \u2029]"
-	const expected = `"\"foobar\"\u003chtml\u003e [\u2028 \u2029]"`
-	b, err := Marshal(input)
-	if err != nil {
-		t.Fatalf("Marshal error: %v", err)
-	}
-	if s := string(b); s != expected {
-		t.Errorf("Encoding of [%s]:\n got [%s]\nwant [%s]", input, s, expected)
-	}
-}
-
 // WrongString is a struct that's misusing the ,string modifier.
 type WrongString struct {
-	Message string `json5:"result,string"`
+	Message string `json:"result,string"`
 }
 
 type wrongStringTest struct {
@@ -679,6 +662,77 @@ var wrongStringTests = []wrongStringTest{
 	{`{"result":"x"}`, `json: invalid use of ,string struct tag, trying to unmarshal "x" into string`},
 	{`{"result":"foo"}`, `json: invalid use of ,string struct tag, trying to unmarshal "foo" into string`},
 	{`{"result":"123"}`, `json: invalid use of ,string struct tag, trying to unmarshal "123" into string`},
+	{`{"result":123}`, `json: invalid use of ,string struct tag, trying to unmarshal unquoted value into string`},
+}
+
+func TestErrHandler(t *testing.T) {
+	type ErrHandlerStruct struct {
+		VarName  string `json:"varname,omitempty"`
+		Required string `json:"required,omitempty"`
+		Mode     string `json:"mode,omitempty"`
+
+		Title    string `json:"title,omitempty"`
+		Value    string `json:"value,omitempty"`
+		ImageUrl string `json:"imageUrl,omitempty"`
+		Size     int    `json:"size,omitempty,string"`
+	}
+	data := `[
+	{
+		title: '我的头像',
+		value: '"{{  .AvatarUrl}}"',
+		imageUrl: 'https://www.AvatarUrlImage.com',
+		VarName: 666,
+	},
+	{
+		title: '我的昵称',
+		value: "{{.NickName}}",
+		size: '{{.Size}}',
+		imageUrl: 'https://www.NickNameImage.com'
+	}
+]`
+	UseUnmarshalErrHandler(func(err error) error {
+		if err != nil {
+			switch {
+			case strings.Contains(err.Error(), "json: invalid use of ,string"):
+				return nil
+			case strings.Contains(err.Error(), "json: cannot unmarshal number"):
+				return nil
+			case strings.Contains(err.Error(), "json: cannot unmarshal string"):
+				return nil
+			case strings.Contains(err.Error(), "json: cannot unmarshal number into Go value of type string"):
+				return nil
+			}
+		}
+		return err
+	})
+
+	var res []*ErrHandlerStruct
+	dec := NewDecoder(strings.NewReader(data))
+	err := dec.Decode(&res)
+	if err == nil {
+		fmt.Printf("NewDecoder result: %+v\n", res)
+	} else {
+		fmt.Printf("NewDecoder result: %+v err: %v\n", res, err)
+	}
+	if len(res) != 2 {
+		t.Errorf("Decode: result len is not match")
+	}
+	if err != nil {
+		t.Errorf("Decode: error not nil")
+	}
+	var res2 []*ErrHandlerStruct
+	err2 := Unmarshal([]byte(data), &res2)
+	if err2 == nil {
+		fmt.Printf("Unmarshal result: %+v\n", res2)
+	} else {
+		fmt.Printf("Unmarshal result: %+v err: %v\n", res2, err2)
+	}
+	if len(res2) != 2 {
+		t.Errorf("Unmarshal: result len is not match")
+	}
+	if err2 != nil {
+		t.Errorf("Unmarshal: error not nil")
+	}
 }
 
 // If people misuse the ,string modifier, the error message should be
@@ -689,14 +743,14 @@ func TestErrorMessageFromMisusedString(t *testing.T) {
 		var s WrongString
 		err := NewDecoder(r).Decode(&s)
 		got := fmt.Sprintf("%v", err)
-		if got != tt.err {
+		if !usedUnmarshalErrHandlerHook.Load() && got != tt.err {
 			t.Errorf("%d. got err = %q, want %q", n, got, tt.err)
 		}
 	}
 }
 
 func noSpace(c rune) rune {
-	if isSpace(c) {
+	if isSpace(byte(c)) { // only used for ascii
 		return -1
 	}
 	return c
@@ -718,10 +772,10 @@ type All struct {
 	Float32 float32
 	Float64 float64
 
-	Foo  string `json5:"bar"`
-	Foo2 string `json5:"bar2,dummyopt"`
+	Foo  string `json:"bar"`
+	Foo2 string `json:"bar2,dummyopt"`
 
-	IntStr int64 `json5:",string"`
+	IntStr int64 `json:",string"`
 
 	PBool    *bool
 	PInt     *int
@@ -1046,14 +1100,14 @@ func TestRefUnmarshal(t *testing.T) {
 // Issue 3450
 func TestEmptyString(t *testing.T) {
 	type T2 struct {
-		Number1 int `json5:",string"`
-		Number2 int `json5:",string"`
+		Number1 int `json:",string"`
+		Number2 int `json:",string"`
 	}
 	data := `{"Number1":"1", "Number2":""}`
 	dec := NewDecoder(strings.NewReader(data))
 	var t2 T2
 	err := dec.Decode(&t2)
-	if err == nil {
+	if !usedUnmarshalErrHandlerHook.Load() && err == nil {
 		t.Fatal("Decode: did not return error")
 	}
 	if t2.Number1 != 1 {
@@ -1061,18 +1115,25 @@ func TestEmptyString(t *testing.T) {
 	}
 }
 
-// Test that the returned error is non-nil when trying to unmarshal null string into int, for successive ,string option
-// Issue 7046
+// Test that a null for ,string is not replaced with the previous quoted string (issue 7046).
+// It should also not be an error (issue 2540, issue 8587).
 func TestNullString(t *testing.T) {
 	type T struct {
-		A int `json5:",string"`
-		B int `json5:",string"`
+		A int  `json:",string"`
+		B int  `json:",string"`
+		C *int `json:",string"`
 	}
-	data := []byte(`{"A": "1", "B": null}`)
+	data := []byte(`{"A": "1", "B": null, "C": null}`)
 	var s T
+	s.B = 1
+	s.C = new(int)
+	*s.C = 2
 	err := Unmarshal(data, &s)
-	if err == nil {
-		t.Fatalf("expected error; got %v", s)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if s.B != 1 || s.C != nil {
+		t.Fatalf("after Unmarshal, s.B=%d, s.C=%p, want 1, nil", s.B, s.C)
 	}
 }
 
@@ -1169,30 +1230,6 @@ func TestUnmarshalNulls(t *testing.T) {
 	}
 }
 
-func TestStringKind(t *testing.T) {
-	type stringKind string
-
-	var m1, m2 map[stringKind]int
-	m1 = map[stringKind]int{
-		"foo": 42,
-	}
-
-	data, err := Marshal(m1)
-	if err != nil {
-		t.Errorf("Unexpected error marshalling: %v", err)
-	}
-
-	err = Unmarshal(data, &m2)
-	if err != nil {
-		t.Errorf("Unexpected error unmarshalling: %v", err)
-	}
-
-	if !reflect.DeepEqual(m1, m2) {
-		t.Error("Items should be equal after encoding and then decoding")
-	}
-
-}
-
 var decodeTypeErrorTests = []struct {
 	dest interface{}
 	src  string
@@ -1208,7 +1245,7 @@ var decodeTypeErrorTests = []struct {
 func TestUnmarshalTypeError(t *testing.T) {
 	for _, item := range decodeTypeErrorTests {
 		err := Unmarshal([]byte(item.src), item.dest)
-		if _, ok := err.(*UnmarshalTypeError); !ok {
+		if _, ok := err.(*UnmarshalTypeError); !ok && !usedUnmarshalErrHandlerHook.Load() {
 			t.Errorf("expected type error for Unmarshal(%q, type %T): got %T",
 				item.src, item.dest, err)
 		}
@@ -1240,8 +1277,8 @@ func TestUnmarshalSyntax(t *testing.T) {
 // Issue 4660
 type unexportedFields struct {
 	Name string
-	m    map[string]interface{} `json5:"-"`
-	m2   map[string]interface{} `json5:"abcd"`
+	m    map[string]interface{} `json:"-"`
+	m2   map[string]interface{} `json:"abcd"`
 }
 
 func TestUnmarshalUnexported(t *testing.T) {
@@ -1356,35 +1393,353 @@ func TestInvalidUnmarshal(t *testing.T) {
 	}
 }
 
-type objectDecoder struct {
-	A int
+var invalidUnmarshalTextTests = []struct {
+	v    interface{}
+	want string
+}{
+	{nil, "json: Unmarshal(nil)"},
+	{struct{}{}, "json: Unmarshal(non-pointer struct {})"},
+	{(*int)(nil), "json: Unmarshal(nil *int)"},
+	{new(net.IP), "json: cannot unmarshal string into Go value of type *net.IP"},
 }
 
-func (o *objectDecoder) UnmarshalJSON(data []byte) error {
-	var v struct {
-		A int `json5:"a"`
+func TestInvalidUnmarshalText(t *testing.T) {
+	buf := []byte(`123`)
+	for _, tt := range invalidUnmarshalTextTests {
+		err := Unmarshal(buf, tt.v)
+		if !usedUnmarshalErrHandlerHook.Load() && err == nil {
+			t.Errorf("Unmarshal expecting error, got nil")
+			continue
+		}
+		if !usedUnmarshalErrHandlerHook.Load() {
+			if got := err.Error(); got != tt.want {
+				t.Errorf("Unmarshal = %q; want %q", got, tt.want)
+			}
+		}
 	}
+}
 
-	err := json.Unmarshal(data, &v)
+func TestDecodeSingleQuoteStringInterface(t *testing.T) {
+	buf := []byte(`{ 'key': 'value' }`)
+	got := make(map[string]interface{})
+	err := Unmarshal(buf, &got)
 	if err != nil {
-		return err
+		t.Errorf("Unmarshal: %v", err)
 	}
-
-	o.A = v.A
-
-	return nil
+	want := map[string]interface{}{"key": "value"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Unmarshal = %q; want %q", got, want)
+	}
 }
 
-func TestDecoder_Decode_Unmarshaler(t *testing.T) {
-	j5 := `{
-	// A.
-	"a": 123
+func TestDecodeStringFloat(t *testing.T) {
+	tc := `{
+fr: 1.2,
+fs: '2.3',
+fd: "4.5",
 }`
-	var v objectDecoder
+	t.Run(`toMap`, func(t *testing.T) {
+		m := make(map[string]any)
+		err := Unmarshal([]byte(tc), &m)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if m["fr"].(float64) != 1.2 {
+			t.Errorf("fr: %v", m["fr"])
+		}
+		if m["fs"].(string) != `2.3` {
+			t.Errorf("fs: %v", m["fs"])
+		}
+		if m["fd"].(string) != `4.5` {
+			t.Errorf("fd: %v", m["fd"])
+		}
+	})
 
-	err := NewDecoder(bytes.NewBufferString(j5)).Decode(&v)
+	t.Run(`toFloat32Struct`, func(t *testing.T) {
+		type Floats struct {
+			Fr float32 `json5:"fr"`
+			Fs float32 `json5:"fs"`
+			Fd float32 `json5:"fd"`
+		}
+		f := Floats{}
+		err := Unmarshal([]byte(tc), &f)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if f.Fr != 1.2 {
+			t.Errorf("fr: %v", f.Fr)
+		}
+		if f.Fs != 2.3 {
+			t.Errorf("fs: %v", f.Fs)
+		}
+		if f.Fd != 4.5 {
+			t.Errorf("fd: %v", f.Fd)
+		}
+	})
 
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
+	t.Run(`toFloat64Struct`, func(t *testing.T) {
+		type Floats struct {
+			Fr float64 `json5:"fr"`
+			Fs float64 `json5:"fs"`
+			Fd float64 `json5:"fd"`
+		}
+		f := Floats{}
+		err := Unmarshal([]byte(tc), &f)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if f.Fr != 1.2 {
+			t.Errorf("fr: %v", f.Fr)
+		}
+		if f.Fs != 2.3 {
+			t.Errorf("fs: %v", f.Fs)
+		}
+		if f.Fd != 4.5 {
+			t.Errorf("fd: %v", f.Fd)
+		}
+	})
+}
+
+func TestDecodeStringInt(t *testing.T) {
+	tc := `{
+ir: 1,
+is: '2',
+id: "3",
+}`
+	t.Run(`toMap`, func(t *testing.T) {
+		m := make(map[string]any)
+		err := Unmarshal([]byte(tc), &m)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if m["ir"].(float64) != 1 {
+			t.Errorf("ir: %v", m["ir"])
+		}
+		if m["is"].(string) != `2` {
+			t.Errorf("is: %v", m["is"])
+		}
+		if m["id"].(string) != `3` {
+			t.Errorf("id: %v", m["id"])
+		}
+	})
+
+	t.Run(`toInt8Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir int8 `json5:"ir"`
+			Is int8 `json5:"is"`
+			Id int8 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toInt16Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir int16 `json5:"ir"`
+			Is int16 `json5:"is"`
+			Id int16 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toInt32Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir int32 `json5:"ir"`
+			Is int32 `json5:"is"`
+			Id int32 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toInt64Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir int64 `json5:"ir"`
+			Is int64 `json5:"is"`
+			Id int64 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toUint8Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir uint8 `json5:"ir"`
+			Is uint8 `json5:"is"`
+			Id uint8 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toUint16Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir uint16 `json5:"ir"`
+			Is uint16 `json5:"is"`
+			Id uint16 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toUint32Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir uint32 `json5:"ir"`
+			Is uint32 `json5:"is"`
+			Id uint32 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toUint64Struct`, func(t *testing.T) {
+		type Ints struct {
+			Ir uint64 `json5:"ir"`
+			Is uint64 `json5:"is"`
+			Id uint64 `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toUintStruct`, func(t *testing.T) {
+		type Ints struct {
+			Ir uint `json5:"ir"`
+			Is uint `json5:"is"`
+			Id uint `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
+
+	t.Run(`toIntStruct`, func(t *testing.T) {
+		type Ints struct {
+			Ir int `json5:"ir"`
+			Is int `json5:"is"`
+			Id int `json5:"id"`
+		}
+		i := Ints{}
+		err := Unmarshal([]byte(tc), &i)
+		if err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if i.Ir != 1 {
+			t.Errorf("ir: %v", i.Ir)
+		}
+		if i.Is != 2 {
+			t.Errorf("is: %v", i.Is)
+		}
+		if i.Id != 3 {
+			t.Errorf("id: %v", i.Id)
+		}
+	})
 }
